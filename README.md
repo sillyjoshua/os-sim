@@ -1,4 +1,4 @@
-##OS-Sim
+**OS-Sim**
 
 Free, Open-source OS simualator
 ---
