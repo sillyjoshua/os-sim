@@ -8,6 +8,22 @@ export type OssRunResult = {
   errors: string[];
 };
 
+// Words treated as "truthy"/"falsy" when checked with `if`, `istrue`, etc.
+const TRUTHY_WORDS = new Set(["true", "yes", "on", "1", "y"]);
+const FALSY_WORDS = new Set(["false", "no", "off", "0", "n"]);
+
+/**
+ * Resolves a token/value to a boolean using common keyword conventions.
+ * Falls back to plain JS truthiness (non-empty string) for anything
+ * that isn't an explicit true/false-style keyword.
+ */
+function toBool(raw: string): boolean {
+  const v = raw.trim().toLowerCase();
+  if (TRUTHY_WORDS.has(v)) return true;
+  if (FALSY_WORDS.has(v)) return false;
+  return v.length > 0;
+}
+
 export function runOssScript(
   source: string,
   opts: {
@@ -23,6 +39,16 @@ export function runOssScript(
 
   const lines = source.replace(/\r\n/g, "\n").split("\n");
 
+  // --- if/else/endif block handling -----------------------------------
+  // We do a lightweight pre-pass per `if` encountered: find the matching
+  // `else`/`endif` on the same nesting level so we can skip blocks.
+  type Frame = { active: boolean; taken: boolean };
+  const stack: Frame[] = [];
+
+  function currentlyActive() {
+    return stack.every((f) => f.active);
+  }
+
   for (let i = 0; i < lines.length; i += 1) {
     const raw = lines[i];
     const lineNo = i + 1;
@@ -35,6 +61,57 @@ export function runOssScript(
       if (tokens.length === 0) continue;
 
       const cmd = tokens[0].toLowerCase();
+
+      // --- control flow (always processed, even when inactive, so we
+      // can correctly track nesting) ---
+      if (cmd === "if") {
+        // Usage: if <value>              -> truthy check via keywords
+        //        if <value> == <value>   -> equality check
+        //        if <value> contains <value> -> substring check
+        const active = currentlyActive();
+        let result = false;
+
+        if (!active) {
+          // Parent block inactive: push an inactive frame, don't evaluate.
+          stack.push({ active: false, taken: true });
+          continue;
+        }
+
+        if (tokens.length === 2) {
+          result = toBool(tokens[1]);
+        } else if (tokens.length === 4 && tokens[2] === "==") {
+          result = tokens[1].trim().toLowerCase() === tokens[3].trim().toLowerCase();
+        } else if (tokens.length === 4 && tokens[2].toLowerCase() === "contains") {
+          result = tokens[1].toLowerCase().includes(tokens[3].toLowerCase());
+        } else if (tokens.length === 4 && tokens[2] === "!=") {
+          result = tokens[1].trim().toLowerCase() !== tokens[3].trim().toLowerCase();
+        } else {
+          throw new Error(
+            'Usage: if "value" | if "a" == "b" | if "a" != "b" | if "a" contains "b"',
+          );
+        }
+
+        stack.push({ active: result, taken: result });
+        continue;
+      }
+
+      if (cmd === "else") {
+        if (stack.length === 0) throw new Error("else without if");
+        const frame = stack[stack.length - 1];
+        const parentActive = stack.slice(0, -1).every((f) => f.active);
+        frame.active = parentActive && !frame.taken;
+        frame.taken = frame.taken || frame.active;
+        continue;
+      }
+
+      if (cmd === "endif") {
+        if (stack.length === 0) throw new Error("endif without if");
+        stack.pop();
+        continue;
+      }
+
+      // Skip everything else while inside an inactive block.
+      if (!currentlyActive()) continue;
 
       if (cmd === "print") {
         output.push(tokens.slice(1).join(" "));
@@ -131,6 +208,89 @@ export function runOssScript(
         continue;
       }
 
+      // --- NEW: read a file's content into a variable and/or print it ---
+      if (cmd === "read") {
+        // Usage: read "file.txt"                -> prints content
+        //        read "file.txt" into varname    -> stores content in $varname
+        if (tokens.length !== 2 && !(tokens.length === 4 && tokens[2].toLowerCase() === "into")) {
+          throw new Error('Usage: read "file.txt" | read "file.txt" into varname');
+        }
+
+        const filename = tokens[1];
+        const children = listChildren(cwd);
+        const existing = children.find(
+          (n) => n.type === "file" && n.name.toLowerCase() === filename.toLowerCase(),
+        );
+
+        if (!existing) throw new Error(`File not found: ${filename}`);
+        const text = existing.content ?? "";
+
+        if (tokens.length === 4) {
+          const varName = tokens[3];
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) {
+            throw new Error("Invalid variable name");
+          }
+          vars.set(varName, text);
+        } else {
+          output.push(text);
+        }
+        continue;
+      }
+
+      // --- NEW: check a file's content for a keyword (true/false/yes/no/etc,
+      // or an arbitrary substring), optionally storing the boolean result. ---
+      if (cmd === "checkfile") {
+        // Usage: checkfile "file.txt" contains "keyword" into varname
+        //        checkfile "file.txt" istrue into varname
+        if (tokens.length < 4) {
+          throw new Error(
+            'Usage: checkfile "file.txt" contains "keyword" into varname | checkfile "file.txt" istrue into varname',
+          );
+        }
+
+        const filename = tokens[1];
+        const mode = tokens[2].toLowerCase();
+
+        const children = listChildren(cwd);
+        const existing = children.find(
+          (n) => n.type === "file" && n.name.toLowerCase() === filename.toLowerCase(),
+        );
+        if (!existing) throw new Error(`File not found: ${filename}`);
+        const text = (existing.content ?? "").trim();
+
+        let result: boolean;
+        let varName: string | undefined;
+
+        if (mode === "contains") {
+          // checkfile "file" contains "keyword" [into varname]
+          const keyword = tokens[3];
+          result = text.toLowerCase().includes(keyword.toLowerCase());
+          if (tokens.length >= 6 && tokens[4].toLowerCase() === "into") {
+            varName = tokens[5];
+          }
+        } else if (mode === "istrue") {
+          // checkfile "file" istrue [into varname]
+          // Reads the whole file content and checks it against the
+          // true/false keyword set (true, yes, on, 1 vs false, no, off, 0).
+          result = toBool(text);
+          if (tokens.length >= 5 && tokens[3].toLowerCase() === "into") {
+            varName = tokens[4];
+          }
+        } else {
+          throw new Error(`Unknown checkfile mode: ${tokens[2]}`);
+        }
+
+        if (varName) {
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) {
+            throw new Error("Invalid variable name");
+          }
+          vars.set(varName, result ? "true" : "false");
+        }
+
+        output.push(`checkfile ${filename}: ${result ? "true" : "false"}`);
+        continue;
+      }
+
       if (cmd === "theme") {
         if (tokens.length !== 2) throw new Error("Usage: theme win95|winxp|win7|win10|win11");
         const id = tokens[1] as WindowsThemeId;
@@ -145,6 +305,10 @@ export function runOssScript(
     } catch (e) {
       errors.push(`Line ${lineNo}: ${e instanceof Error ? e.message : "Error"}`);
     }
+  }
+
+  if (stack.length > 0) {
+    errors.push(`Missing endif (${stack.length} block${stack.length > 1 ? "s" : ""} left open)`);
   }
 
   return { output, errors };
